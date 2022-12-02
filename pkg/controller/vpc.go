@@ -347,15 +347,26 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	vpc.Status.Router = key
 	vpc.Status.Standby = true
 	vpc.Status.VpcPeerings = newPeers
-	if c.config.EnableLb {
-		vpcLb, err := c.addLoadBalancer(key)
-		if err != nil {
-			return err
+	if value, ok := vpc.Annotations[util.VpcEnableLbAnnotation]; ok && c.config.EnableLb {
+		if value == util.VpcAnnotationEnableOn {
+			vpcLb, err := c.addLoadBalancer(key)
+			if err != nil {
+				return err
+			}
+			vpc.Status.TcpLoadBalancer = vpcLb.TcpLoadBalancer
+			vpc.Status.TcpSessionLoadBalancer = vpcLb.TcpSessLoadBalancer
+			vpc.Status.UdpLoadBalancer = vpcLb.UdpLoadBalancer
+			vpc.Status.UdpSessionLoadBalancer = vpcLb.UdpSessLoadBalancer
+		} else if value == util.VpcAnnotationEnableOff {
+			lbs := []string{vpc.Status.TcpLoadBalancer, vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpLoadBalancer, vpc.Status.UdpSessionLoadBalancer}
+			if err = c.ovnClient.DeleteLoadBalancer(lbs...); err != nil {
+				return err
+			}
+			vpc.Status.TcpLoadBalancer = ""
+			vpc.Status.TcpSessionLoadBalancer = ""
+			vpc.Status.UdpLoadBalancer = ""
+			vpc.Status.UdpSessionLoadBalancer = ""
 		}
-		vpc.Status.TcpLoadBalancer = vpcLb.TcpLoadBalancer
-		vpc.Status.TcpSessionLoadBalancer = vpcLb.TcpSessLoadBalancer
-		vpc.Status.UdpLoadBalancer = vpcLb.UdpLoadBalancer
-		vpc.Status.UdpSessionLoadBalancer = vpcLb.UdpSessLoadBalancer
 	}
 	bytes, err := vpc.Status.Bytes()
 	if err != nil {
@@ -366,12 +377,38 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 		return err
 	}
 
-	if len(vpc.Annotations) != 0 && strings.ToLower(vpc.Annotations[util.VpcLbAnnotation]) == "on" {
+	if value, ok := vpc.Annotations[util.VpcEnableLbAnnotation]; ok && value == util.VpcAnnotationEnableOn && len(vpc.Annotations) != 0 && strings.ToLower(vpc.Annotations[util.VpcLbAnnotation]) == "on" {
 		if err = c.createVpcLb(vpc); err != nil {
 			return err
 		}
 	} else if err = c.deleteVpcLb(vpc); err != nil {
 		return err
+	}
+
+	if value, ok := vpc.Annotations[util.VpcEnableLbAnnotation]; ok && c.config.EnableLb {
+		for _, s := range vpc.Status.Subnets {
+			if s == c.config.NodeSwitch {
+				continue
+			}
+			subnet, err := c.subnetsLister.Get(s)
+			if err != nil {
+				klog.Errorf("failed to get subnet %s of vpc, %v", s, err)
+				return err
+			}
+			if value == util.VpcAnnotationEnableOn {
+				// add lb to ls
+				if err := c.ovnClient.AddLbToLogicalSwitch(vpc.Status.TcpLoadBalancer, vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpLoadBalancer, vpc.Status.UdpSessionLoadBalancer, subnet.Name); err != nil {
+					c.patchSubnetStatus(subnet, "AddLbToLogicalSwitchFailed", err.Error())
+					return err
+				}
+			} else if value == util.VpcAnnotationEnableOff {
+				// remove lb from ls
+				if err := c.ovnClient.RemoveLbFromLogicalSwitch(vpc.Status.TcpLoadBalancer, vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpLoadBalancer, vpc.Status.UdpSessionLoadBalancer, subnet.Name); err != nil {
+					c.patchSubnetStatus(subnet, "RemoveLbFromLogicalSwitchFailed", err.Error())
+					return err
+				}
+			}
+		}
 	}
 
 	return nil

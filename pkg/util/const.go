@@ -29,6 +29,7 @@ const (
 
 	LogicalRouterAnnotation = "ovn.kubernetes.io/logical_router"
 	VpcAnnotation           = "ovn.kubernetes.io/vpc"
+	VpcEnableLbAnnotation   = "ovn.kubernetes.io/vpc_enable_lb"
 
 	Layer2ForwardAnnotationTemplate = "%s.kubernetes.io/layer2_forward"
 	PortSecurityAnnotationTemplate  = "%s.kubernetes.io/port_security"
@@ -160,4 +161,7 @@ const (
 	NetemQosLatencyAnnotationTemplate = "%s.kubernetes.io/latency"
 	NetemQosLimitAnnotationTemplate   = "%s.kubernetes.io/limit"
 	NetemQosLossAnnotationTemplate    = "%s.kubernetes.io/loss"
+
+	VpcAnnotationEnableOn  = "on"
+	VpcAnnotationEnableOff = "off"
 )
