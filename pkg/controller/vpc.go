@@ -110,6 +110,14 @@ func (c *Controller) handleDelVpc(vpc *kubeovnv1.Vpc) error {
 	if err != nil {
 		return err
 	}
+
+	if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == util.VpcAnnotationEnableOn {
+		// delete dns and clear dns_records from logical_switch
+		if err := c.deleteDnsAndRemoveFromLogicalSwitch(vpc); err != nil {
+			klog.Errorf("failed to delete dns and clear dns_records from logical_switch %v", err)
+			return err
+		}
+	}
 	return nil
 }
 
@@ -361,6 +369,27 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	if err != nil {
 		return err
 	}
+
+	if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok {
+		if value == util.VpcAnnotationEnableOn {
+			// create dns and set dns_records to logical_switch
+			if err := c.createDnsAndSetToLogicalSwitch(vpc); err != nil {
+				klog.Errorf("failed to create dns and set dns to logical_switch %v", err)
+				return err
+			}
+			if err := c.setRecordsToRelatedServices(vpc); err != nil {
+				klog.Errorf("failed to set dns_records by related services %v", err)
+				return err
+			}
+		} else if value == util.VpcAnnotationEnableOff {
+			// delete dns and clear dns_records from logical_switch
+			if err := c.deleteDnsAndRemoveFromLogicalSwitch(vpc); err != nil {
+				klog.Errorf("failed to delete dns and clear dns_records from logical_switch %v", err)
+				return err
+			}
+		}
+	}
+
 	vpc, err = c.config.KubeOvnClient.KubeovnV1().Vpcs().Patch(context.Background(), vpc.Name, types.MergePatchType, bytes, metav1.PatchOptions{}, "status")
 	if err != nil {
 		return err
@@ -650,4 +679,93 @@ func (c *Controller) createVpcRouter(lr string) error {
 // deleteVpcRouter delete router to connect logical switches in vpc
 func (c *Controller) deleteVpcRouter(lr string) error {
 	return c.ovnClient.DeleteLogicalRouter(lr)
+}
+
+func (c *Controller) createDnsAndSetToLogicalSwitch(vpc *kubeovnv1.Vpc) error {
+	// create dns if uuid not found
+	dnsUuidStr, ok := vpc.Annotations[util.DnsUuidAnnotation]
+	if !ok {
+		// get dns
+		externalIds := fmt.Sprintf("vpc=%s", vpc.Name)
+		dnsUuid, err := c.ovnClient.CreateDnsWithExternalIds(externalIds)
+		if err != nil {
+			klog.Errorf("failed to create dns by external_ids:%s, %v", externalIds, err)
+			return err
+		}
+		dnsUuidStr = dnsUuid
+		// set annotation to vpc
+		vpc.Annotations[util.DnsUuidAnnotation] = dnsUuidStr
+		if _, err := c.config.KubeOvnClient.KubeovnV1().Vpcs().Update(context.Background(), vpc, metav1.UpdateOptions{}); err != nil {
+			klog.Errorf("failed to update vpc %s in namespace %s, %v", vpc.Name, vpc.Namespace, err)
+			return err
+		}
+	}
+
+	// set dns to logical_switch if dns_record not found
+	for _, subnet := range vpc.Status.Subnets {
+		// get dns_records from logical_switch
+		dnsRecords, err := c.ovnClient.GetDnsRecordsFromLogicalSwitch(subnet)
+		if err != nil {
+			klog.Errorf("failed to get dns_records from logical_switch %s, %v", subnet, err)
+			return err
+		}
+		// set records to dns
+		if !strings.Contains(dnsRecords, dnsUuidStr) {
+			if err := c.ovnClient.SetDnsRecordsToLogicalSwitch(subnet, dnsUuidStr); err != nil {
+				klog.Errorf("failed to set dns_records %v to logical_switch %v, %v", dnsUuidStr, subnet, err)
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) deleteDnsAndRemoveFromLogicalSwitch(vpc *kubeovnv1.Vpc) error {
+	// get dns_uuid from svc
+	if dnsUuidsStr, ok := vpc.Annotations[util.DnsUuidAnnotation]; ok {
+		// remove from logical_switch if dns_records found
+		for _, subnet := range vpc.Status.Subnets {
+			// get dns_records from logical_switch
+			dnsRecords, err := c.ovnClient.GetDnsRecordsFromLogicalSwitch(subnet)
+			if err != nil {
+				klog.Errorf("failed to get dns_records from logical_switch %s, %v", subnet, err)
+				return err
+			}
+			if strings.Contains(dnsRecords, dnsUuidsStr) {
+				if err := c.ovnClient.ClearDnsRecordsFromLogicalSwitch(subnet); err != nil {
+					klog.Errorf("failed to clear dns_records %v to logical_switch %v, %v", dnsUuidsStr, subnet, err)
+					return err
+				}
+			}
+		}
+		// delete dns
+		if err := c.ovnClient.DestroyDnsRecords(dnsUuidsStr); err != nil {
+			klog.Errorf("failed to destroy dns %s, %v", dnsUuidsStr, err)
+			return err
+		}
+		// remove annotation from vpc
+		delete(vpc.Annotations, util.DnsUuidAnnotation)
+		if _, err := c.config.KubeOvnClient.KubeovnV1().Vpcs().Update(context.Background(), vpc, metav1.UpdateOptions{}); err != nil {
+			klog.Errorf("failed to update vpc %s in namespace %s, %v", vpc.Name, vpc.Namespace, err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Controller) setRecordsToRelatedServices(vpc *kubeovnv1.Vpc) error {
+	sel, _ := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: map[string]string{util.VpcAnnotation: vpc.Name}})
+	svcs, err := c.servicesLister.List(sel)
+	if err != nil {
+		klog.Errorf("failed to list service by vpc %s, %v", vpc.Name, err)
+		return err
+	}
+	for _, svc := range svcs {
+		if err := c.setDnsRecords(vpc, svc.Name, svc.Spec.ClusterIP); err != nil {
+			klog.Errorf("failed to set records to dns, %v", err)
+			return err
+		}
+	}
+	return nil
 }

@@ -45,6 +45,26 @@ func (c *Controller) enqueueAddService(obj interface{}) {
 			c.updateNpQueue.Add(np)
 		}
 	}
+
+	// if vpc enable dns
+	vpcName := svc.Annotations[util.VpcAnnotation]
+	if vpcName != "" {
+		vpc, err := c.vpcsLister.Get(vpcName)
+		if err != nil {
+			klog.Errorf("failed to get vpc %s of lb, %v", vpcName, err)
+			utilruntime.HandleError(err)
+			return
+		}
+		if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == util.VpcAnnotationEnableOn {
+			// set records to dns
+			if err := c.setDnsRecords(vpc, svc.Name, svc.Spec.ClusterIP); err != nil {
+				klog.Errorf("svc %s in namespace %v, failed to create dns_records and set to logical_switch %v", svc.Name, svc.Namespace, err)
+				utilruntime.HandleError(err)
+				return
+			}
+		}
+	}
+
 }
 
 func (c *Controller) enqueueDeleteService(obj interface{}) {
@@ -77,6 +97,25 @@ func (c *Controller) enqueueDeleteService(obj interface{}) {
 			klog.Infof("delete vpc service %v", vpcSvc)
 			c.deleteServiceQueue.Add(vpcSvc)
 		}
+		// if vpc enable dns
+		vpcName := svc.Annotations[util.VpcAnnotation]
+		if vpcName != "" {
+			vpc, err := c.vpcsLister.Get(vpcName)
+			if err != nil {
+				klog.Errorf("failed to get vpc %s of lb, %v", vpcName, err)
+				utilruntime.HandleError(err)
+				return
+			}
+			if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == util.VpcAnnotationEnableOn {
+				// delete records from dns
+				if err := c.RemoveDnsRecords(vpc, svc.Name); err != nil {
+					klog.Errorf("svc %s in namespace %v, failed to create dns_records and set to logical_switch %v", svc.Name, svc.Namespace, err)
+					utilruntime.HandleError(err)
+					return
+				}
+			}
+		}
+
 	}
 }
 
@@ -328,6 +367,82 @@ func (c *Controller) handleUpdateService(key string) error {
 			if err := c.ovnClient.DeleteLoadBalancerVip(vip, udpLb); err != nil {
 				klog.Errorf("failed to delete vip %s from udp lb %v", vip, err)
 				return err
+			}
+		}
+	}
+
+	// vpc dns
+	if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok {
+		if value == util.VpcAnnotationEnableOn {
+			// set records to dns
+			if err := c.setDnsRecords(vpc, svc.Name, svc.Spec.ClusterIP); err != nil {
+				klog.Errorf("svc %s in namespace %v, failed to create dns_records and set to logical_switch %v", svc.Name, svc.Namespace, err)
+				return err
+			}
+		} else if value == util.VpcAnnotationEnableOff {
+			// delete records from dns
+			if err := c.RemoveDnsRecords(vpc, svc.Name); err != nil {
+				klog.Errorf("svc %s in namespace %v, failed to create dns_records and set to logical_switch %v", svc.Name, svc.Namespace, err)
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+
+func (c *Controller) setDnsRecords(vpc *kubeovnv1.Vpc, svcName, ip string) error {
+	// set records to dns if dns_uuid found
+	dnsUuidsStr, ok := vpc.Annotations[util.DnsUuidAnnotation]
+	if ok {
+		// get records from dns
+		dnsRecords, err := c.ovnClient.GetDnsRecords(dnsUuidsStr)
+		if err != nil {
+			klog.Errorf("failed to get records from dns %s, %v", dnsUuidsStr, err)
+			return err
+		}
+		// generate dns records
+		for _, domain := range []string{svcName, fmt.Sprintf("%s.localdomain", svcName)} {
+			record := fmt.Sprintf("records:%s=\"%s ::1\"", domain, ip)
+			// update records if clusterIp change
+			if strings.Contains(dnsRecords, svcName) {
+				if strings.Contains(dnsRecords, ip) {
+					continue
+				}
+				if err := c.ovnClient.RemoveDnsRecords(dnsUuidsStr, fmt.Sprintf("%s %s.localdomain", svcName, svcName)); err != nil {
+					klog.Errorf("failed to remove records %v to dns %s, %v", svcName, dnsUuidsStr, err)
+					return err
+				}
+			}
+			// set records to dns
+			if err := c.ovnClient.SetDnsRecords(dnsUuidsStr, record); err != nil {
+				klog.Errorf("failed to set records %v to dns %s, %v", record, dnsUuidsStr, err)
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) RemoveDnsRecords(vpc *kubeovnv1.Vpc, svcName string) error {
+	// remove records from dns if dns_uuid found
+	dnsUuidsStr, ok := vpc.Annotations[util.DnsUuidAnnotation]
+	if ok {
+		// get records from dns
+		dnsRecords, err := c.ovnClient.GetDnsRecords(dnsUuidsStr)
+		if err != nil {
+			klog.Errorf("failed to get records from dns %s, %v", dnsUuidsStr, err)
+			return err
+		}
+		// remove records from dns
+		for _, domain := range []string{svcName, fmt.Sprintf("%s.localdomain", svcName)} {
+			if strings.Contains(dnsRecords, domain) {
+				if err := c.ovnClient.RemoveDnsRecords(dnsUuidsStr, domain); err != nil {
+					klog.Errorf("failed to remove records %v from dns %s, %v", domain, dnsUuidsStr, err)
+					return err
+				}
 			}
 		}
 	}

@@ -31,6 +31,7 @@ func (c *Controller) gc() error {
 		c.gcStaticRoute,
 		c.gcVpcNatGateway,
 		c.gcLogicalRouterPort,
+		c.gcDNS,
 	}
 	for _, gcFunc := range gcFunctions {
 		if err := gcFunc(); err != nil {
@@ -638,4 +639,24 @@ func (c *Controller) isOVNProvided(providerName string, pod *corev1.Pod) (bool, 
 		return false, nil
 	}
 	return true, nil
+}
+
+func (c *Controller) gcDNS() error {
+	klog.Infof("start to gc dns")
+	vpcs, err := c.vpcsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list vpc %v", err)
+		return err
+	}
+	for _, vpc := range vpcs {
+		if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == util.VpcAnnotationEnableOn {
+			continue
+		}
+		// delete dns and clear dns_records from logical_switch
+		if err := c.deleteDnsAndRemoveFromLogicalSwitch(vpc); err != nil {
+			klog.Errorf("failed to delete dns and clear dns_records from logical_switch %v", err)
+			return err
+		}
+	}
+	return nil
 }

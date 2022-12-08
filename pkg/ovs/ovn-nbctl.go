@@ -457,6 +457,69 @@ func (c Client) CreateLogicalSwitch(ls, lr, subnet, gateway string, needRouter b
 	return nil
 }
 
+func (c Client) CreateDnsWithExternalIds(externalIds string) (string, error) {
+	output, err := c.ovnNbCommand("create", "DNS", fmt.Sprintf("external_ids:%s", externalIds))
+	if err != nil {
+		return output, fmt.Errorf("failed to create dns, %v", err)
+	}
+	return output, nil
+}
+
+func (c Client) GetDnsRecords(uuid string) (string, error) {
+	output, err := c.ovnNbCommand("get", "DNS", uuid, "records")
+	if err != nil {
+		return "", fmt.Errorf("failed to set dns records, %v", err)
+	}
+	return output, nil
+}
+
+func (c Client) SetDnsRecords(uuid string, records string) error {
+	_, err := c.ovnNbCommand("set", "DNS", uuid, records)
+	if err != nil {
+		return fmt.Errorf("failed to set dns records, %v", err)
+	}
+	return nil
+}
+
+func (c Client) RemoveDnsRecords(uuid string, records string) error {
+	_, err := c.ovnNbCommand("remove", "DNS", uuid, "records", records)
+	if err != nil {
+		return fmt.Errorf("failed to remove dns records, %v", err)
+	}
+	return nil
+}
+
+func (c Client) DestroyDnsRecords(uuid string) error {
+	if _, err := c.ovnNbCommand("destroy", "DNS", uuid); err != nil {
+		return fmt.Errorf("failed to destroy dns records, %v", err)
+	}
+	return nil
+}
+
+func (c Client) SetDnsRecordsToLogicalSwitch(logicalSwitch, dnsUuid string) error {
+	if _, err := c.ovnNbCommand("set", "Logical_Switch", logicalSwitch, fmt.Sprintf("dns_records=%s", dnsUuid)); err != nil {
+		return fmt.Errorf("failed to set dns to logical_switch, %v", err)
+	}
+	return nil
+}
+
+func (c Client) ClearDnsRecordsFromLogicalSwitch(logicalSwitch string) error {
+	if _, err := c.ovnNbCommand("clear", "Logical_Switch", logicalSwitch, "dns_records"); err != nil {
+		return fmt.Errorf("failed to clear dns to logical_switch, %v", err)
+	}
+	return nil
+}
+
+func (c Client) GetDnsRecordsFromLogicalSwitch(logicalSwitch string) (string, error) {
+	output, err := c.ovnNbCommand("get", "Logical_Switch", logicalSwitch, "dns_records")
+	if err != nil {
+		return output, fmt.Errorf("failed to get dns from logical_switch, %v", err)
+	}
+	output = strings.Trim(output, "[")
+	output = strings.Trim(output, "]")
+	return output, nil
+}
+
 func (c Client) AddLbToLogicalSwitch(tcpLb, tcpSessLb, udpLb, udpSessLb, ls string) error {
 	if err := c.addLoadBalancerToLogicalSwitch(tcpLb, ls); err != nil {
 		klog.Errorf("failed to add tcp lb to %s, %v", ls, err)
