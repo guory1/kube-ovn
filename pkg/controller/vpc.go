@@ -6,6 +6,7 @@ import (
 	"net"
 	"reflect"
 	"strings"
+	"time"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -348,7 +349,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	vpc.Status.Standby = true
 	vpc.Status.VpcPeerings = newPeers
 	if value, ok := vpc.Annotations[util.VpcEnableLbAnnotation]; ok && c.config.EnableLb {
-		if value == util.VpcAnnotationEnableOn {
+		if value == "true" {
 			vpcLb, err := c.addLoadBalancer(key)
 			if err != nil {
 				return err
@@ -357,7 +358,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 			vpc.Status.TcpSessionLoadBalancer = vpcLb.TcpSessLoadBalancer
 			vpc.Status.UdpLoadBalancer = vpcLb.UdpLoadBalancer
 			vpc.Status.UdpSessionLoadBalancer = vpcLb.UdpSessLoadBalancer
-		} else if value == util.VpcAnnotationEnableOff {
+		} else if value == "false" {
 			lbs := []string{vpc.Status.TcpLoadBalancer, vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpLoadBalancer, vpc.Status.UdpSessionLoadBalancer}
 			if err = c.ovnClient.DeleteLoadBalancer(lbs...); err != nil {
 				return err
@@ -377,7 +378,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 		return err
 	}
 
-	if value, ok := vpc.Annotations[util.VpcEnableLbAnnotation]; ok && value == util.VpcAnnotationEnableOn && len(vpc.Annotations) != 0 && strings.ToLower(vpc.Annotations[util.VpcLbAnnotation]) == "on" {
+	if value, ok := vpc.Annotations[util.VpcEnableLbAnnotation]; ok && value == "true" && len(vpc.Annotations) != 0 && strings.ToLower(vpc.Annotations[util.VpcLbAnnotation]) == "on" {
 		if err = c.createVpcLb(vpc); err != nil {
 			return err
 		}
@@ -395,13 +396,13 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 				klog.Errorf("failed to get subnet %s of vpc, %v", s, err)
 				return err
 			}
-			if value == util.VpcAnnotationEnableOn {
+			if value == "true" {
 				// add lb to ls
 				if err := c.ovnClient.AddLbToLogicalSwitch(vpc.Status.TcpLoadBalancer, vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpLoadBalancer, vpc.Status.UdpSessionLoadBalancer, subnet.Name); err != nil {
 					c.patchSubnetStatus(subnet, "AddLbToLogicalSwitchFailed", err.Error())
 					return err
 				}
-			} else if value == util.VpcAnnotationEnableOff {
+			} else if value == "false" {
 				// remove lb from ls
 				if err := c.ovnClient.RemoveLbFromLogicalSwitch(vpc.Status.TcpLoadBalancer, vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpLoadBalancer, vpc.Status.UdpSessionLoadBalancer, subnet.Name); err != nil {
 					c.patchSubnetStatus(subnet, "RemoveLbFromLogicalSwitchFailed", err.Error())
@@ -687,4 +688,53 @@ func (c *Controller) createVpcRouter(lr string) error {
 // deleteVpcRouter delete router to connect logical switches in vpc
 func (c *Controller) deleteVpcRouter(lr string) error {
 	return c.ovnClient.DeleteLogicalRouter(lr)
+}
+
+func (c *Controller) runProtectLoadBalancer() {
+	klog.Info("Starting protect load_balancer")
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+loop:
+	for {
+		select {
+		case <-ticker.C:
+			err := c.protectLoadBalancer()
+			if err != nil {
+				klog.Errorf("failed to protect load_balancer: %v", err)
+				break loop
+			}
+		}
+	}
+	return
+}
+
+func (c *Controller) protectLoadBalancer() error {
+	klog.Infof("start to protect loadbalancers")
+	if c.config.EnableLb {
+		vpcs, err := c.vpcsLister.List(labels.Everything())
+		if err != nil {
+			return err
+		}
+		for _, orivpc := range vpcs {
+			vpc := orivpc.DeepCopy()
+			if value, ok := vpc.Annotations[util.VpcEnableLbAnnotation]; !ok || value != "true" {
+				continue
+			}
+			// check load_balancer
+			for _, subnetName := range vpc.Status.Subnets {
+				err = c.ovnClient.CheckAndAddLbToLogicalSwitch(
+					vpc.Status.TcpLoadBalancer,
+					vpc.Status.TcpSessionLoadBalancer,
+					vpc.Status.UdpLoadBalancer,
+					vpc.Status.UdpSessionLoadBalancer,
+					subnetName)
+				if err != nil {
+					klog.Errorf("failed to check lb of ls %s, %v", subnetName, err)
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
 }

@@ -201,7 +201,7 @@ func (c *Controller) initLoadBalancer() error {
 
 	for _, orivpc := range vpcs {
 		vpc := orivpc.DeepCopy()
-		if value, ok := vpc.Annotations[util.VpcEnableLbAnnotation]; !ok || value != util.VpcAnnotationEnableOn {
+		if value, ok := vpc.Annotations[util.VpcEnableLbAnnotation]; !ok || value != "true" {
 			continue
 		}
 		vpcLb := c.GenVpcLoadBalancer(vpc.Name)
