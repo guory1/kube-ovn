@@ -111,7 +111,7 @@ func (c *Controller) handleDelVpc(vpc *kubeovnv1.Vpc) error {
 		return err
 	}
 
-	if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == util.VpcAnnotationEnableOn {
+	if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == "true" {
 		// delete dns and clear dns_records from logical_switch
 		if err := c.deleteDnsAndRemoveFromLogicalSwitch(vpc); err != nil {
 			klog.Errorf("failed to delete dns and clear dns_records from logical_switch %v", err)
@@ -371,7 +371,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	}
 
 	if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok {
-		if value == util.VpcAnnotationEnableOn {
+		if value == "true" {
 			// create dns and set dns_records to logical_switch
 			if err := c.createDnsAndSetToLogicalSwitch(vpc); err != nil {
 				klog.Errorf("failed to create dns and set dns to logical_switch %v", err)
@@ -381,7 +381,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 				klog.Errorf("failed to set dns_records by related services %v", err)
 				return err
 			}
-		} else if value == util.VpcAnnotationEnableOff {
+		} else if value == "false" {
 			// delete dns and clear dns_records from logical_switch
 			if err := c.deleteDnsAndRemoveFromLogicalSwitch(vpc); err != nil {
 				klog.Errorf("failed to delete dns and clear dns_records from logical_switch %v", err)
@@ -702,17 +702,23 @@ func (c *Controller) createDnsAndSetToLogicalSwitch(vpc *kubeovnv1.Vpc) error {
 	}
 
 	// set dns to logical_switch if dns_record not found
-	for _, subnet := range vpc.Status.Subnets {
+	for _, subnetName := range vpc.Status.Subnets {
+		if _, err := c.subnetsLister.Get(subnetName); err != nil {
+			if k8serrors.IsNotFound(err) {
+				continue
+			}
+			return err
+		}
 		// get dns_records from logical_switch
-		dnsRecords, err := c.ovnClient.GetDnsRecordsFromLogicalSwitch(subnet)
+		dnsRecords, err := c.ovnClient.GetDnsRecordsFromLogicalSwitch(subnetName)
 		if err != nil {
-			klog.Errorf("failed to get dns_records from logical_switch %s, %v", subnet, err)
+			klog.Errorf("failed to get dns_records from logical_switch %s, %v", subnetName, err)
 			return err
 		}
 		// set records to dns
 		if !strings.Contains(dnsRecords, dnsUuidStr) {
-			if err := c.ovnClient.SetDnsRecordsToLogicalSwitch(subnet, dnsUuidStr); err != nil {
-				klog.Errorf("failed to set dns_records %v to logical_switch %v, %v", dnsUuidStr, subnet, err)
+			if err := c.ovnClient.SetDnsRecordsToLogicalSwitch(subnetName, dnsUuidStr); err != nil {
+				klog.Errorf("failed to set dns_records %v to logical_switch %v, %v", dnsUuidStr, subnetName, err)
 				return err
 			}
 		}
@@ -725,22 +731,28 @@ func (c *Controller) deleteDnsAndRemoveFromLogicalSwitch(vpc *kubeovnv1.Vpc) err
 	// get dns_uuid from svc
 	if dnsUuidsStr, ok := vpc.Annotations[util.DnsUuidAnnotation]; ok {
 		// remove from logical_switch if dns_records found
-		for _, subnet := range vpc.Status.Subnets {
+		for _, subnetName := range vpc.Status.Subnets {
+			if _, err := c.subnetsLister.Get(subnetName); err != nil {
+				if k8serrors.IsNotFound(err) {
+					continue
+				}
+				return err
+			}
 			// get dns_records from logical_switch
-			dnsRecords, err := c.ovnClient.GetDnsRecordsFromLogicalSwitch(subnet)
+			dnsRecords, err := c.ovnClient.GetDnsRecordsFromLogicalSwitch(subnetName)
 			if err != nil {
-				klog.Errorf("failed to get dns_records from logical_switch %s, %v", subnet, err)
+				klog.Errorf("failed to get dns_records from logical_switch %s, %v", subnetName, err)
 				return err
 			}
 			if strings.Contains(dnsRecords, dnsUuidsStr) {
-				if err := c.ovnClient.ClearDnsRecordsFromLogicalSwitch(subnet); err != nil {
-					klog.Errorf("failed to clear dns_records %v to logical_switch %v, %v", dnsUuidsStr, subnet, err)
+				if err := c.ovnClient.ClearDnsRecordsFromLogicalSwitch(subnetName); err != nil {
+					klog.Errorf("failed to clear dns_records %v to logical_switch %v, %v", dnsUuidsStr, subnetName, err)
 					return err
 				}
 			}
 		}
 		// delete dns
-		if err := c.ovnClient.DestroyDnsRecords(dnsUuidsStr); err != nil {
+		if err := c.ovnClient.DestroyDns(dnsUuidsStr); err != nil {
 			klog.Errorf("failed to destroy dns %s, %v", dnsUuidsStr, err)
 			return err
 		}

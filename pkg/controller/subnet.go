@@ -719,7 +719,7 @@ func (c *Controller) handleAddOrUpdateSubnet(key string) error {
 	}
 
 	// vpc dns
-	if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == util.VpcAnnotationEnableOn {
+	if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == "true" {
 		dnsUuidStr, ok := vpc.Annotations[util.DnsUuidAnnotation]
 		if ok {
 			// set dns_records to logical_switch if not found

@@ -55,7 +55,7 @@ func (c *Controller) enqueueAddService(obj interface{}) {
 			utilruntime.HandleError(err)
 			return
 		}
-		if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == util.VpcAnnotationEnableOn {
+		if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == "true" {
 			// set records to dns
 			if err := c.setDnsRecords(vpc, svc.Name, svc.Spec.ClusterIP); err != nil {
 				klog.Errorf("svc %s in namespace %v, failed to create dns_records and set to logical_switch %v", svc.Name, svc.Namespace, err)
@@ -106,7 +106,7 @@ func (c *Controller) enqueueDeleteService(obj interface{}) {
 				utilruntime.HandleError(err)
 				return
 			}
-			if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == util.VpcAnnotationEnableOn {
+			if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == "true" {
 				// delete records from dns
 				if err := c.RemoveDnsRecords(vpc, svc.Name); err != nil {
 					klog.Errorf("svc %s in namespace %v, failed to create dns_records and set to logical_switch %v", svc.Name, svc.Namespace, err)
@@ -373,13 +373,13 @@ func (c *Controller) handleUpdateService(key string) error {
 
 	// vpc dns
 	if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok {
-		if value == util.VpcAnnotationEnableOn {
+		if value == "true" {
 			// set records to dns
 			if err := c.setDnsRecords(vpc, svc.Name, svc.Spec.ClusterIP); err != nil {
 				klog.Errorf("svc %s in namespace %v, failed to create dns_records and set to logical_switch %v", svc.Name, svc.Namespace, err)
 				return err
 			}
-		} else if value == util.VpcAnnotationEnableOff {
+		} else if value == "false" {
 			// delete records from dns
 			if err := c.RemoveDnsRecords(vpc, svc.Name); err != nil {
 				klog.Errorf("svc %s in namespace %v, failed to create dns_records and set to logical_switch %v", svc.Name, svc.Namespace, err)

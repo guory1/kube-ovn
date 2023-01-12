@@ -489,11 +489,30 @@ func (c Client) RemoveDnsRecords(uuid string, records string) error {
 	return nil
 }
 
-func (c Client) DestroyDnsRecords(uuid string) error {
+func (c Client) DestroyDns(uuid string) error {
 	if _, err := c.ovnNbCommand("destroy", "DNS", uuid); err != nil {
 		return fmt.Errorf("failed to destroy dns records, %v", err)
 	}
 	return nil
+}
+
+func (c Client) ListDns() ([]string, error) {
+	output, err := c.ovnNbCommand("list", "DNS")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list dns, %v", err)
+	}
+	lines := strings.Split(output, "\n")
+	result := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if !strings.Contains(l, "_uuid") {
+			continue
+		}
+		arr := strings.Split(l, ":")
+		if len(arr) > 1 {
+			result = append(result, strings.TrimSpace(arr[1]))
+		}
+	}
+	return result, nil
 }
 
 func (c Client) SetDnsRecordsToLogicalSwitch(logicalSwitch, dnsUuid string) error {

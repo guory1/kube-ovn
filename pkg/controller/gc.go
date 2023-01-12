@@ -648,14 +648,26 @@ func (c *Controller) gcDNS() error {
 		klog.Errorf("failed to list vpc %v", err)
 		return err
 	}
+	vpcDnsRecordsMap := make(map[string]string)
 	for _, vpc := range vpcs {
-		if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == util.VpcAnnotationEnableOn {
-			continue
+		if value, ok := vpc.Annotations[util.DnsEnableAnnotation]; ok && value == "true" {
+			if dnsUuidStr, ok := vpc.Annotations[util.DnsUuidAnnotation]; ok {
+				vpcDnsRecordsMap[dnsUuidStr] = ""
+			}
 		}
-		// delete dns and clear dns_records from logical_switch
-		if err := c.deleteDnsAndRemoveFromLogicalSwitch(vpc); err != nil {
-			klog.Errorf("failed to delete dns and clear dns_records from logical_switch %v", err)
-			return err
+	}
+	dnsList, err := c.ovnClient.ListDns()
+	if err != nil {
+		klog.Errorf("failed to list dns %v", err)
+		return err
+	}
+	for _, dnsUuid := range dnsList {
+		// if no exist, destroy dns
+		if _, ok := vpcDnsRecordsMap[dnsUuid]; !ok {
+			if err := c.ovnClient.DestroyDns(dnsUuid); err != nil {
+				klog.Errorf("failed to destroy dns %v", err)
+				return err
+			}
 		}
 	}
 	return nil
