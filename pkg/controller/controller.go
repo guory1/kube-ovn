@@ -35,18 +35,19 @@ const controllerAgentName = "kube-ovn-controller"
 type Controller struct {
 	config *Configuration
 	vpcs   *sync.Map
-	//subnetVpcMap *sync.Map
+	// subnetVpcMap *sync.Map
 	podSubnetMap *sync.Map
 	ovnClient    *ovs.Client
 	ipam         *ovnipam.IPAM
 
-	podsLister             v1.PodLister
-	podsSynced             cache.InformerSynced
-	addPodQueue            workqueue.RateLimitingInterface
-	deletePodQueue         workqueue.RateLimitingInterface
-	updatePodQueue         workqueue.RateLimitingInterface
-	updatePodSecurityQueue workqueue.RateLimitingInterface
-	podKeyMutex            *keymutex.KeyMutex
+	podsLister              v1.PodLister
+	podsSynced              cache.InformerSynced
+	addPodQueue             workqueue.RateLimitingInterface
+	deletePodQueue          workqueue.RateLimitingInterface
+	updatePodQueue          workqueue.RateLimitingInterface
+	updatePodSecurityQueue  workqueue.RateLimitingInterface
+	updatePodIPAddressQueue workqueue.RateLimitingInterface
+	podKeyMutex             *keymutex.KeyMutex
 
 	vpcsLister           kubeovnlister.VpcLister
 	vpcSynced            cache.InformerSynced
@@ -80,9 +81,8 @@ type Controller struct {
 	vlansLister kubeovnlister.VlanLister
 	vlanSynced  cache.InformerSynced
 
-	providerNetworksLister     kubeovnlister.ProviderNetworkLister
-	providerNetworkSynced      cache.InformerSynced
-	updateProviderNetworkQueue workqueue.RateLimitingInterface
+	providerNetworksLister kubeovnlister.ProviderNetworkLister
+	providerNetworkSynced  cache.InformerSynced
 
 	addVlanQueue    workqueue.RateLimitingInterface
 	delVlanQueue    workqueue.RateLimitingInterface
@@ -207,17 +207,17 @@ func NewController(config *Configuration) *Controller {
 		delVlanQueue:    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DelVlan"),
 		updateVlanQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "UpdateVlan"),
 
-		providerNetworksLister:     providerNetworkInformer.Lister(),
-		providerNetworkSynced:      providerNetworkInformer.Informer().HasSynced,
-		updateProviderNetworkQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "UpdateProviderNetwork"),
+		providerNetworksLister: providerNetworkInformer.Lister(),
+		providerNetworkSynced:  providerNetworkInformer.Informer().HasSynced,
 
-		podsLister:             podInformer.Lister(),
-		podsSynced:             podInformer.Informer().HasSynced,
-		addPodQueue:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "AddPod"),
-		deletePodQueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DeletePod"),
-		updatePodQueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "UpdatePod"),
-		updatePodSecurityQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "UpdatePodSecurity"),
-		podKeyMutex:            keymutex.New(97),
+		podsLister:              podInformer.Lister(),
+		podsSynced:              podInformer.Informer().HasSynced,
+		addPodQueue:             workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "AddPod"),
+		deletePodQueue:          workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DeletePod"),
+		updatePodQueue:          workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "UpdatePod"),
+		updatePodSecurityQueue:  workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "UpdatePodSecurity"),
+		updatePodIPAddressQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "UpdatePodIPAddress"),
+		podKeyMutex:             keymutex.New(97),
 
 		namespacesLister:  namespaceInformer.Lister(),
 		namespacesSynced:  namespaceInformer.Informer().HasSynced,
@@ -314,9 +314,9 @@ func NewController(config *Configuration) *Controller {
 		UpdateFunc: controller.enqueueUpdateVlan,
 	})
 
-	providerNetworkInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		UpdateFunc: controller.enqueueUpdateProviderNetwork,
-	})
+	// providerNetworkInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	// 	UpdateFunc: controller.enqueueUpdateProviderNetwork,
+	// })
 
 	if config.EnableNP {
 		npInformer := informerFactory.Networking().V1().NetworkPolicies()
@@ -414,6 +414,9 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 
 	// start workers to do all the network operations
 	c.startWorkers(stopCh)
+	// protect load balancer
+	c.runProtectLoadBalancer()
+
 	<-stopCh
 	klog.Info("Shutting down workers")
 }
@@ -445,8 +448,6 @@ func (c *Controller) shutdown() {
 	c.addVlanQueue.ShutDown()
 	c.delVlanQueue.ShutDown()
 	c.updateVlanQueue.ShutDown()
-
-	c.updateProviderNetworkQueue.ShutDown()
 
 	c.addOrUpdateVpcQueue.ShutDown()
 	c.updateVpcStatusQueue.ShutDown()
@@ -532,7 +533,7 @@ func (c *Controller) startWorkers(stopCh <-chan struct{}) {
 
 	go wait.Until(c.runDelVpcWorker, time.Second, stopCh)
 	go wait.Until(c.runUpdateVpcStatusWorker, time.Second, stopCh)
-	go wait.Until(c.runUpdateProviderNetworkWorker, time.Second, stopCh)
+	// go wait.Until(c.runUpdateProviderNetworkWorker, time.Second, stopCh)
 
 	if c.config.EnableLb {
 		// run in a single worker to avoid delete the last vip, which will lead ovn to delete the loadbalancer
@@ -544,6 +545,7 @@ func (c *Controller) startWorkers(stopCh <-chan struct{}) {
 		go wait.Until(c.runDeletePodWorker, time.Second, stopCh)
 		go wait.Until(c.runUpdatePodWorker, time.Second, stopCh)
 		go wait.Until(c.runUpdatePodSecurityWorker, time.Second, stopCh)
+		go wait.Until(c.runUpdatePodIPAddressWorker, time.Second, stopCh)
 
 		go wait.Until(c.runDeleteSubnetWorker, time.Second, stopCh)
 		go wait.Until(c.runDeleteRouteWorker, time.Second, stopCh)
@@ -602,4 +604,9 @@ func (c *Controller) startWorkers(stopCh <-chan struct{}) {
 	}
 
 	go wait.Until(c.syncVmLiveMigrationPort, 15*time.Second, stopCh)
+
+	go wait.Until(c.resyncProviderNetworkStatus, 15*time.Second, stopCh)
+
+	// Just for ECX
+	go wait.Until(c.gcIP, 5*time.Minute, stopCh)
 }

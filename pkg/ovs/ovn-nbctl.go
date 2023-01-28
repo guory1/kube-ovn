@@ -436,6 +436,15 @@ func (c Client) SetLogicalSwitchConfig(ls, lr, protocol, subnet, gateway string,
 	return nil
 }
 
+func (c Client) SetRouterPortNetworks(ls, lr, gateways string) error {
+	networks := strings.ReplaceAll(strings.Join(strings.Split(gateways, ","), " "), ":", "\\:")
+	_, err := c.ovnNbCommand("set", "logical_router_port", fmt.Sprintf("%s-%s", lr, ls), fmt.Sprintf("networks=%s", networks))
+	if err != nil {
+		klog.Errorf("set networks '%s' to router port failed: %v", networks, err)
+	}
+	return err
+}
+
 // CreateLogicalSwitch create logical switch in ovn, connect it to router and apply tcp/udp lb rules
 func (c Client) CreateLogicalSwitch(ls, lr, subnet, gateway string, needRouter bool) error {
 	_, err := c.ovnNbCommand(MayExist, "ls-add", ls, "--",
@@ -584,6 +593,67 @@ func (c Client) RemoveLbFromLogicalSwitch(tcpLb, tcpSessLb, udpLb, udpSessLb, ls
 		return err
 	}
 
+	return nil
+}
+
+func (c Client) CheckAndAddLbToLogicalSwitch(tcpLb, tcpSessLb, udpLb, udpSessLb, ls string) error {
+	loadBalancers, err := c.GetLogicalSwitchLoadBalancer(ls)
+	if err != nil {
+		klog.Errorf("failed to get lb from ls %s, %v", ls, err)
+		return err
+	}
+	// tcpLb
+	tcpLbUuid, err := c.FindLoadbalancer(tcpLb)
+	if err != nil {
+		klog.Errorf("failed to find lb %s, %v", tcpLb, err)
+		return err
+	}
+	if !strings.Contains(loadBalancers, tcpLbUuid) {
+		klog.Infof("starting add lb %s to ls %s", tcpLb, ls)
+		if err := c.addLoadBalancerToLogicalSwitch(tcpLb, ls); err != nil {
+			klog.Errorf("failed to add tcp lb to %s, %v", ls, err)
+			return err
+		}
+	}
+	// udpLb
+	udpLbUuid, err := c.FindLoadbalancer(udpLb)
+	if err != nil {
+		klog.Errorf("failed to find lb %s, %v", udpLb, err)
+		return err
+	}
+	if !strings.Contains(loadBalancers, udpLbUuid) {
+		klog.Infof("starting add lb %s to ls %s", udpLb, ls)
+		if err := c.addLoadBalancerToLogicalSwitch(udpLb, ls); err != nil {
+			klog.Errorf("failed to add udp lb to %s, %v", ls, err)
+			return err
+		}
+	}
+	// tcpSessLb
+	tcpSessLbUuid, err := c.FindLoadbalancer(tcpSessLb)
+	if err != nil {
+		klog.Errorf("failed to find lb %s, %v", tcpSessLb, err)
+		return err
+	}
+	if !strings.Contains(loadBalancers, tcpSessLbUuid) {
+		klog.Infof("starting add lb %s to ls %s", tcpSessLb, ls)
+		if err := c.addLoadBalancerToLogicalSwitch(tcpSessLb, ls); err != nil {
+			klog.Errorf("failed to add tcp session lb to %s, %v", ls, err)
+			return err
+		}
+	}
+	// udpSessLb
+	udpSessLbUuid, err := c.FindLoadbalancer(udpSessLb)
+	if err != nil {
+		klog.Errorf("failed to find lb %s, %v", udpSessLb, err)
+		return err
+	}
+	if !strings.Contains(loadBalancers, udpSessLbUuid) {
+		klog.Infof("starting add lb %s to ls %s", udpSessLb, ls)
+		if err := c.addLoadBalancerToLogicalSwitch(udpSessLb, ls); err != nil {
+			klog.Errorf("failed to add udp session lb to %s, %v", ls, err)
+			return err
+		}
+	}
 	return nil
 }
 
@@ -923,8 +993,8 @@ func (c Client) CreatePeerRouterPort(localRouter, remoteRouter, localRouterPortI
 		}
 	}
 
-	_, err = c.ovnNbCommand("set", "logical_router_port", localRouterPort,
-		fmt.Sprintf("networks=%s", strings.ReplaceAll(localRouterPortIP, ",", " ")))
+	networks := strings.ReplaceAll(strings.Join(strings.Split(localRouterPortIP, ","), " "), ":", "\\:")
+	_, err = c.ovnNbCommand("set", "logical_router_port", localRouterPort, fmt.Sprintf("networks=%s", networks))
 
 	if err != nil {
 		klog.Errorf("failed to set router port %s: %v", localRouterPort, err)
@@ -1830,6 +1900,14 @@ func CheckAlive() error {
 		return err
 	}
 	return nil
+}
+
+func (c Client) GetLogicalSwitchLoadBalancer(logicalSwitch string) (string, error) {
+	output, err := c.ovnNbCommand("get", "logical_switch", logicalSwitch, "load_balancer")
+	if err != nil {
+		return "", err
+	}
+	return output, nil
 }
 
 // GetLogicalSwitchExcludeIPS get a logical switch exclude ips
