@@ -201,6 +201,9 @@ func (c *Controller) initLoadBalancer() error {
 
 	for _, orivpc := range vpcs {
 		vpc := orivpc.DeepCopy()
+		if vpc.Annotations[util.VpcEnableOvnLbAnnotation] != "true" {
+			continue
+		}
 		vpcLb := c.GenVpcLoadBalancer(vpc.Name)
 
 		tcpLb, err := c.ovnClient.FindLoadbalancer(vpcLb.TcpLoadBalancer)
