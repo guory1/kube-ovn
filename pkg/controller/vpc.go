@@ -446,6 +446,15 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 		}
 	}
 
+	if c.config.EnableMcast {
+		if err = c.ovnClient.SetLogicalRouterMulticast(vpc.Name); err != nil {
+			klog.Errorf("failed to set lr '%s' multicast mode", vpc.Name, err)
+		}
+	} else {
+		if err = c.ovnClient.SetLogicalRouterMulticast(vpc.Name); err != nil {
+			klog.Errorf("failed to unset lr '%s' multicast mode", vpc.Name, err)
+		}
+	}
 	return nil
 }
 
