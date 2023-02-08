@@ -51,6 +51,18 @@ func (ipam *IPAM) GetRandomAddress(podName, nicName, subnetName string, skippedA
 	return string(v4IP), string(v6IP), mac, err
 }
 
+func (ipam *IPAM) ReleaseIPAddressByPodNameAndNicName(podName, nicName, subnetName string) (err error) {
+	ipam.mutex.RLock()
+	defer ipam.mutex.RUnlock()
+	subnet, ok := ipam.Subnets[subnetName]
+	if !ok {
+		return ErrNoAvailable
+	}
+
+	subnet.releaseAddr(podName, nicName)
+	return nil
+}
+
 func (ipam *IPAM) GetStaticAddress(podName, nicName, ip, mac, subnetName string, checkConflict bool) (string, string, string, error) {
 	ipam.mutex.RLock()
 	defer ipam.mutex.RUnlock()
@@ -67,13 +79,13 @@ func (ipam *IPAM) GetStaticAddress(podName, nicName, ip, mac, subnetName string,
 			}
 			ips = append(ips, ipAddr)
 		}
-		ips, err = checkAndAppendIpsForDual(ips, podName, nicName, subnet)
-		if err != nil {
-			klog.Errorf("failed to append allocate ip %v mac %s for %s", ips, mac, podName)
-			return "", "", "", err
-		}
+		// ips, err = checkAndAppendIpsForDual(ips, podName, nicName, subnet)
+		// if err != nil {
+		// 	klog.Errorf("failed to append allocate ip %v mac %s for %s", ips, mac, podName)
+		// 	return "", "", "", err
+		// }
 
-		switch subnet.Protocol {
+		switch util.CheckProtocol(ip) {
 		case kubeovnv1.ProtocolIPv4:
 			klog.Infof("allocate v4 %s mac %s for %s", ip, mac, podName)
 			return ip, "", mac, err
@@ -83,6 +95,7 @@ func (ipam *IPAM) GetStaticAddress(podName, nicName, ip, mac, subnetName string,
 		case kubeovnv1.ProtocolDual:
 			klog.Infof("allocate v4 %s v6 %s mac %s for %s", string(ips[0]), string(ips[1]), mac, podName)
 			return string(ips[0]), string(ips[1]), mac, err
+
 		}
 	}
 	return "", "", "", ErrNoAvailable
@@ -160,9 +173,11 @@ func (ipam *IPAM) AddOrUpdateSubnet(name, cidrStr string, excludeIps []string) e
 			subnet.V4ReleasedIPList = IPRangeList{}
 			for nicName, ip := range subnet.V4NicToIP {
 				mac := subnet.NicToMac[nicName]
-				podName := subnet.V4IPToPod[ip]
-				if _, _, err := subnet.GetStaticAddress(podName, nicName, ip, mac, true, true); err != nil {
-					klog.Errorf("%s address not in subnet %s new cidr %s: %v", podName, name, cidrStr, err)
+				podList := strings.Split(subnet.V4IPToPod[ip], ",")
+				for _, podName := range podList {
+					if _, _, err := subnet.GetStaticAddress(podName, nicName, ip, mac, true, true); err != nil {
+						klog.Errorf("%s address not in subnet %s new cidr %s: %v", podName, name, cidrStr, err)
+					}
 				}
 			}
 		}
@@ -177,9 +192,11 @@ func (ipam *IPAM) AddOrUpdateSubnet(name, cidrStr string, excludeIps []string) e
 			subnet.V6ReleasedIPList = IPRangeList{}
 			for nicName, ip := range subnet.V6NicToIP {
 				mac := subnet.NicToMac[nicName]
-				podName := subnet.V6IPToPod[ip]
-				if _, _, err := subnet.GetStaticAddress(podName, nicName, ip, mac, true, true); err != nil {
-					klog.Errorf("%s address not in subnet %s new cidr %s: %v", podName, name, cidrStr, err)
+				podList := strings.Split(subnet.V6IPToPod[ip], ",")
+				for _, podName := range podList {
+					if _, _, err := subnet.GetStaticAddress(podName, nicName, ip, mac, true, true); err != nil {
+						klog.Errorf("%s address not in subnet %s new cidr %s: %v", podName, name, cidrStr, err)
+					}
 				}
 			}
 		}

@@ -6,6 +6,7 @@ import (
 	"net"
 	"reflect"
 	"strings"
+	"time"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -109,6 +110,14 @@ func (c *Controller) handleDelVpc(vpc *kubeovnv1.Vpc) error {
 	err := c.deleteVpcRouter(vpc.Status.Router)
 	if err != nil {
 		return err
+	}
+
+	if vpc.Annotations[util.DnsEnableAnnotation] == "true" {
+		// delete dns and clear dns_records from logical_switch
+		if err := c.destroyVpcDns(vpc); err != nil {
+			klog.Errorf("failed to delete dns and clear dns_records from logical_switch %v", err)
+			return err
+		}
 	}
 	return nil
 }
@@ -347,7 +356,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	vpc.Status.Router = key
 	vpc.Status.Standby = true
 	vpc.Status.VpcPeerings = newPeers
-	if c.config.EnableLb {
+	if vpc.Annotations[util.VpcEnableOvnLbAnnotation] == "true" && c.config.EnableLb {
 		vpcLb, err := c.addLoadBalancer(key)
 		if err != nil {
 			return err
@@ -356,11 +365,48 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 		vpc.Status.TcpSessionLoadBalancer = vpcLb.TcpSessLoadBalancer
 		vpc.Status.UdpLoadBalancer = vpcLb.UdpLoadBalancer
 		vpc.Status.UdpSessionLoadBalancer = vpcLb.UdpSessLoadBalancer
+	} else {
+		lbs := []string{vpc.Status.TcpLoadBalancer, vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpLoadBalancer, vpc.Status.UdpSessionLoadBalancer}
+		if err = c.ovnClient.DeleteLoadBalancer(lbs...); err != nil {
+			return err
+		}
+		vpc.Status.TcpLoadBalancer = ""
+		vpc.Status.TcpSessionLoadBalancer = ""
+		vpc.Status.UdpLoadBalancer = ""
+		vpc.Status.UdpSessionLoadBalancer = ""
 	}
+
 	bytes, err := vpc.Status.Bytes()
 	if err != nil {
 		return err
 	}
+
+	if vpc.Annotations[util.DnsEnableAnnotation] == "true" {
+		if vpc.Annotations[util.DnsUuidAnnotation] == "" {
+			// create dns and set dns_records to logical_switch
+			if err := c.createDnsAndSetToLogicalSwitch(vpc); err != nil {
+				klog.Errorf("failed to create dns and set dns to logical_switch %v", err)
+				return err
+			}
+			if err := c.setRecordsToRelatedServices(vpc); err != nil {
+				klog.Errorf("failed to set dns_records by related services %v", err)
+				return err
+			}
+		} else {
+			// delete dns and clear dns_records from logical_switch
+			if err := c.destroyVpcDns(vpc); err != nil {
+				klog.Errorf("failed to delete dns and clear dns_records from logical_switch %v", err)
+				return err
+			}
+			// remove annotation from vpc
+			delete(vpc.Annotations, util.DnsUuidAnnotation)
+			if _, err := c.config.KubeOvnClient.KubeovnV1().Vpcs().Update(context.Background(), vpc, metav1.UpdateOptions{}); err != nil {
+				klog.Errorf("failed to update vpc %s, %v", vpc.Name, err)
+				return err
+			}
+		}
+	}
+
 	vpc, err = c.config.KubeOvnClient.KubeovnV1().Vpcs().Patch(context.Background(), vpc.Name, types.MergePatchType, bytes, metav1.PatchOptions{}, "status")
 	if err != nil {
 		return err
@@ -374,6 +420,41 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 		return err
 	}
 
+	if value, ok := vpc.Annotations[util.VpcEnableOvnLbAnnotation]; ok && c.config.EnableLb {
+		for _, s := range vpc.Status.Subnets {
+			if s == c.config.NodeSwitch {
+				continue
+			}
+			subnet, err := c.subnetsLister.Get(s)
+			if err != nil {
+				klog.Errorf("failed to get subnet %s of vpc, %v", s, err)
+				return err
+			}
+			if value == "true" {
+				// add lb to ls
+				if err := c.ovnClient.AddLbToLogicalSwitch(vpc.Status.TcpLoadBalancer, vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpLoadBalancer, vpc.Status.UdpSessionLoadBalancer, subnet.Name); err != nil {
+					c.patchSubnetStatus(subnet, "AddLbToLogicalSwitchFailed", err.Error())
+					return err
+				}
+			} else if value == "false" {
+				// remove lb from ls
+				if err := c.ovnClient.RemoveLbFromLogicalSwitch(vpc.Status.TcpLoadBalancer, vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpLoadBalancer, vpc.Status.UdpSessionLoadBalancer, subnet.Name); err != nil {
+					c.patchSubnetStatus(subnet, "RemoveLbFromLogicalSwitchFailed", err.Error())
+					return err
+				}
+			}
+		}
+	}
+
+	if c.config.EnableMcast {
+		if err = c.ovnClient.SetLogicalRouterMulticast(vpc.Name); err != nil {
+			klog.Errorf("failed to set lr '%s' multicast mode", vpc.Name, err)
+		}
+	} else {
+		if err = c.ovnClient.SetLogicalRouterMulticast(vpc.Name); err != nil {
+			klog.Errorf("failed to unset lr '%s' multicast mode", vpc.Name, err)
+		}
+	}
 	return nil
 }
 
@@ -638,7 +719,6 @@ func (c *Controller) createVpcRouter(lr string) error {
 	if err != nil {
 		return err
 	}
-	klog.Infof("exists routers %v", lrs)
 	for _, r := range lrs {
 		if lr == r {
 			return nil
@@ -650,4 +730,122 @@ func (c *Controller) createVpcRouter(lr string) error {
 // deleteVpcRouter delete router to connect logical switches in vpc
 func (c *Controller) deleteVpcRouter(lr string) error {
 	return c.ovnClient.DeleteLogicalRouter(lr)
+}
+
+func (c *Controller) createDnsAndSetToLogicalSwitch(vpc *kubeovnv1.Vpc) error {
+	// create dns if uuid not found
+	dnsUuidStr, ok := vpc.Annotations[util.DnsUuidAnnotation]
+	if !ok || dnsUuidStr == "" {
+		dnsUuid, err := c.ovnClient.CreateDns(vpc.Name)
+		if err != nil {
+			klog.Errorf("failed to create dns for vpc %s, %v", vpc.Name, err)
+			return err
+		}
+		dnsUuidStr = dnsUuid
+		// set annotation to vpc
+		vpc.Annotations[util.DnsUuidAnnotation] = dnsUuidStr
+		if _, err := c.config.KubeOvnClient.KubeovnV1().Vpcs().Update(context.Background(), vpc, metav1.UpdateOptions{}); err != nil {
+			klog.Errorf("failed to update vpc %s %s, %v", vpc.Name, err)
+			return err
+		}
+	}
+
+	// set dns to logical_switch if dns_record not found
+	for _, subnetName := range vpc.Status.Subnets {
+		if _, err := c.subnetsLister.Get(subnetName); err != nil {
+			if k8serrors.IsNotFound(err) {
+				continue
+			}
+			return err
+		}
+		if err := c.ovnClient.SetDnsRecordsToLogicalSwitch(subnetName, dnsUuidStr); err != nil {
+			klog.Errorf("failed to set dns_records %v to logical_switch %v, %v", dnsUuidStr, subnetName, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *Controller) destroyVpcDns(vpc *kubeovnv1.Vpc) error {
+	uuid, err := c.ovnClient.FindDns(vpc.Name)
+	if err != nil {
+		return err
+	}
+	if uuid != "" {
+		// destroy dns
+		if err := c.ovnClient.DestroyDns(uuid); err != nil {
+			klog.Errorf("failed to destroy dns %s, %v", uuid, err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Controller) setRecordsToRelatedServices(vpc *kubeovnv1.Vpc) error {
+	sel, _ := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: map[string]string{util.VpcAnnotation: vpc.Name}})
+	svcs, err := c.servicesLister.List(sel)
+	if err != nil {
+		klog.Errorf("failed to list service by vpc %s, %v", vpc.Name, err)
+		return err
+	}
+	for _, svc := range svcs {
+		if err := c.setDnsRecords(vpc, svc.Name, svc.Spec.ClusterIP); err != nil {
+			klog.Errorf("failed to set records to dns, %v", err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Controller) runProtectLoadBalancer() {
+	klog.Info("Starting protect load_balancer")
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			err := c.protectLoadBalancer()
+			if err != nil {
+				klog.Errorf("failed to protect load_balancer: %v", err)
+			}
+		}
+	}
+}
+
+func (c *Controller) protectLoadBalancer() error {
+	klog.Infof("start to protect loadbalancers")
+	if c.config.EnableLb {
+		vpcs, err := c.vpcsLister.List(labels.Everything())
+		if err != nil {
+			return err
+		}
+		for _, orivpc := range vpcs {
+			vpc := orivpc.DeepCopy()
+			if vpc.Annotations[util.VpcEnableOvnLbAnnotation] != "true" {
+				continue
+			}
+			if vpc.Status.TcpLoadBalancer == "" || vpc.Status.TcpSessionLoadBalancer == "" ||
+				vpc.Status.UdpLoadBalancer == "" || vpc.Status.UdpSessionLoadBalancer == "" {
+				return fmt.Errorf("lb for vpc '%s' uninitialized", vpc.Name)
+			}
+
+			// check load_balancer
+			for _, subnetName := range vpc.Status.Subnets {
+				err = c.ovnClient.CheckAndAddLbToLogicalSwitch(
+					vpc.Status.TcpLoadBalancer,
+					vpc.Status.TcpSessionLoadBalancer,
+					vpc.Status.UdpLoadBalancer,
+					vpc.Status.UdpSessionLoadBalancer,
+					subnetName)
+				if err != nil {
+					klog.Errorf("failed to check lb of ls %s, %v", subnetName, err)
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
 }

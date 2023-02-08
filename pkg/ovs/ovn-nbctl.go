@@ -399,6 +399,48 @@ func (c Client) ListPodLogicalSwitchPorts(pod, namespace string) ([]string, erro
 	return result, nil
 }
 
+func (c Client) SetLogicalSwitchMulticast(ls, lr, gateway string) (err error) {
+	mac := util.GenerateMac()
+	if lr != "" && lr != "ovn-cluster" {
+		results, err := c.CustomFindEntity("logical_router_port", []string{"mac"},
+			fmt.Sprintf("name=%s-%s", lr, ls))
+		if err != nil {
+			klog.Errorf("failed to list logical_router_port, %v", err)
+			return err
+		}
+		if len(results) > 0 {
+			mac = results[0]["mac"][0]
+		}
+	}
+
+	cmd := []string{"set", "logical_switch", ls, fmt.Sprintf("other_config:mcast_eth_src=%s", mac),
+		"other_config:mcast_querier=true", "other_config:mcast_snoop=true", "other_config:mcast_flood_unregistered=false"}
+
+	ipStr := strings.Split(gateway, ",")
+	cmd = append(cmd, fmt.Sprintf("other_config:mcast_ip4_src=%s", ipStr[0]))
+	if len(ipStr) == 2 {
+		cmd = append(cmd, fmt.Sprintf("other_config:mcast_ip6_src=%s", ipStr[1]))
+	}
+	_, err = c.ovnNbCommand(cmd...)
+	return err
+}
+
+func (c Client) UnsetLogicalSwitchMulticast(ls string) (err error) {
+	_, err = c.ovnNbCommand("set", "logical_switch", ls, "other_config:mcast_querier=false", "other_config:mcast_snoop=false",
+		"other_config:mcast_flood_unregistered=true")
+	return err
+}
+
+func (c Client) SetLogicalRouterMulticast(lr string) (err error) {
+	_, err = c.ovnNbCommand("set", "logical_router", lr, "options:mcast_relay=true")
+	return err
+}
+
+func (c Client) UnsetLogicalRouterMulticast(lr string) (err error) {
+	_, err = c.ovnNbCommand("set", "logical_router", lr, "options:mcast_relay=false")
+	return err
+}
+
 func (c Client) SetLogicalSwitchConfig(ls, lr, protocol, subnet, gateway string, excludeIps []string, needRouter bool) error {
 	var err error
 	cidrBlocks := strings.Split(subnet, ",")
@@ -436,6 +478,15 @@ func (c Client) SetLogicalSwitchConfig(ls, lr, protocol, subnet, gateway string,
 	return nil
 }
 
+func (c Client) SetRouterPortNetworks(ls, lr, gateways string) error {
+	networks := strings.ReplaceAll(strings.Join(strings.Split(gateways, ","), " "), ":", "\\:")
+	_, err := c.ovnNbCommand("set", "logical_router_port", fmt.Sprintf("%s-%s", lr, ls), fmt.Sprintf("networks=%s", networks))
+	if err != nil {
+		klog.Errorf("set networks '%s' to router port failed: %v", networks, err)
+	}
+	return err
+}
+
 // CreateLogicalSwitch create logical switch in ovn, connect it to router and apply tcp/udp lb rules
 func (c Client) CreateLogicalSwitch(ls, lr, subnet, gateway string, needRouter bool) error {
 	_, err := c.ovnNbCommand(MayExist, "ls-add", ls, "--",
@@ -455,6 +506,106 @@ func (c Client) CreateLogicalSwitch(ls, lr, subnet, gateway string, needRouter b
 		}
 	}
 	return nil
+}
+
+func (c Client) CreateDns(vpcName string) (string, error) {
+	output, err := c.ovnNbCommand("create", "DNS", fmt.Sprintf("external_ids:vpc=%s", vpcName),
+		fmt.Sprintf("external_ids:vendor=%s", util.CniTypeName))
+	if err != nil {
+		return output, fmt.Errorf("failed to create dns, %v", err)
+	}
+	return output, nil
+}
+
+func (c Client) FindDns(vpcName string) (string, error) {
+	output, err := c.ovnNbCommand("--data=bare", "--no-heading", "--columns=_uuid",
+		"find", "DNS", fmt.Sprintf("external_ids:vpc=%s", vpcName))
+	count := len(strings.FieldsFunc(output, func(c rune) bool { return c == '\n' }))
+	if count > 1 {
+		klog.Errorf("%s has %d dns entries", vpcName, count)
+		return "", fmt.Errorf("%s has %d dnsss entries", vpcName, count)
+	}
+	return output, err
+}
+
+func (c Client) GetDnsRecords(uuid string) (string, error) {
+	output, err := c.ovnNbCommand("get", "DNS", uuid, "records")
+	if err != nil {
+		return "", fmt.Errorf("failed to set dns records, %v", err)
+	}
+	return output, nil
+}
+
+func (c Client) SetDnsRecords(uuid string, records map[string]string) error {
+	if len(records) == 0 {
+		return nil
+	}
+	var recordSet []string
+	for domain, ip := range records {
+		recordSet = append(recordSet, fmt.Sprintf("%s=\"%s\"", domain, ip))
+	}
+	_, err := c.ovnNbCommand("set", "DNS", uuid, fmt.Sprintf("records:%s", strings.Join(recordSet, ",")))
+	if err != nil {
+		return fmt.Errorf("failed to set dns records, %v", err)
+	}
+	return nil
+}
+
+func (c Client) RemoveDnsRecords(uuid string, domains ...string) error {
+	cmd := append([]string{"remove", "DNS", uuid, "records"}, domains...)
+	_, err := c.ovnNbCommand(cmd...)
+	if err != nil {
+		return fmt.Errorf("failed to remove dns records, %v", err)
+	}
+	return nil
+}
+
+func (c Client) DestroyDns(uuid string) error {
+	if _, err := c.ovnNbCommand(IfExists, "destroy", "DNS", uuid); err != nil {
+		return fmt.Errorf("failed to destroy dns records, %v", err)
+	}
+	return nil
+}
+
+func (c Client) ListDns() ([]string, error) {
+	output, err := c.ovnNbCommand("--data=bare", "--no-heading", "--columns=_uuid",
+		"find", "DNS", fmt.Sprintf("external_ids:vendor=%s", util.CniTypeName))
+	if err != nil {
+		return nil, fmt.Errorf("failed to list dns, %v", err)
+	}
+	lines := strings.Split(output, "\n")
+	result := make([]string, 0, len(lines))
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if len(l) > 0 {
+			result = append(result, l)
+		}
+	}
+	return result, nil
+}
+
+func (c Client) SetDnsRecordsToLogicalSwitch(logicalSwitch, dnsUuid string) error {
+	if _, err := c.ovnNbCommand("set", "Logical_Switch", logicalSwitch, fmt.Sprintf("dns_records=%s", dnsUuid)); err != nil {
+		return fmt.Errorf("failed to set dns to logical_switch, %v", err)
+	}
+	return nil
+}
+
+func (c Client) ClearDnsRecordsFromLogicalSwitch(logicalSwitch string) error {
+	if _, err := c.ovnNbCommand("clear", "Logical_Switch", logicalSwitch, "dns_records"); err != nil {
+		return fmt.Errorf("failed to clear dns to logical_switch, %v", err)
+	}
+	return nil
+}
+
+func (c Client) GetDnsRecordsFromLogicalSwitch(logicalSwitch string) (string, error) {
+	output, err := c.ovnNbCommand("get", "Logical_Switch", logicalSwitch, "dns_records")
+	if err != nil {
+		return output, fmt.Errorf("failed to get dns from logical_switch, %v", err)
+	}
+	output = strings.Trim(output, "[")
+	output = strings.Trim(output, "]")
+	return output, nil
 }
 
 func (c Client) AddLbToLogicalSwitch(tcpLb, tcpSessLb, udpLb, udpSessLb, ls string) error {
@@ -502,6 +653,67 @@ func (c Client) RemoveLbFromLogicalSwitch(tcpLb, tcpSessLb, udpLb, udpSessLb, ls
 		return err
 	}
 
+	return nil
+}
+
+func (c Client) CheckAndAddLbToLogicalSwitch(tcpLb, tcpSessLb, udpLb, udpSessLb, ls string) error {
+	loadBalancers, err := c.GetLogicalSwitchLoadBalancer(ls)
+	if err != nil {
+		klog.Errorf("failed to get lb from ls %s, %v", ls, err)
+		return err
+	}
+	// tcpLb
+	tcpLbUuid, err := c.FindLoadbalancer(tcpLb)
+	if err != nil {
+		klog.Errorf("failed to find lb %s, %v", tcpLb, err)
+		return err
+	}
+	if !strings.Contains(loadBalancers, tcpLbUuid) {
+		klog.Infof("starting add lb %s to ls %s", tcpLb, ls)
+		if err := c.addLoadBalancerToLogicalSwitch(tcpLb, ls); err != nil {
+			klog.Errorf("failed to add tcp lb to %s, %v", ls, err)
+			return err
+		}
+	}
+	// udpLb
+	udpLbUuid, err := c.FindLoadbalancer(udpLb)
+	if err != nil {
+		klog.Errorf("failed to find lb %s, %v", udpLb, err)
+		return err
+	}
+	if !strings.Contains(loadBalancers, udpLbUuid) {
+		klog.Infof("starting add lb %s to ls %s", udpLb, ls)
+		if err := c.addLoadBalancerToLogicalSwitch(udpLb, ls); err != nil {
+			klog.Errorf("failed to add udp lb to %s, %v", ls, err)
+			return err
+		}
+	}
+	// tcpSessLb
+	tcpSessLbUuid, err := c.FindLoadbalancer(tcpSessLb)
+	if err != nil {
+		klog.Errorf("failed to find lb %s, %v", tcpSessLb, err)
+		return err
+	}
+	if !strings.Contains(loadBalancers, tcpSessLbUuid) {
+		klog.Infof("starting add lb %s to ls %s", tcpSessLb, ls)
+		if err := c.addLoadBalancerToLogicalSwitch(tcpSessLb, ls); err != nil {
+			klog.Errorf("failed to add tcp session lb to %s, %v", ls, err)
+			return err
+		}
+	}
+	// udpSessLb
+	udpSessLbUuid, err := c.FindLoadbalancer(udpSessLb)
+	if err != nil {
+		klog.Errorf("failed to find lb %s, %v", udpSessLb, err)
+		return err
+	}
+	if !strings.Contains(loadBalancers, udpSessLbUuid) {
+		klog.Infof("starting add lb %s to ls %s", udpSessLb, ls)
+		if err := c.addLoadBalancerToLogicalSwitch(udpSessLb, ls); err != nil {
+			klog.Errorf("failed to add udp session lb to %s, %v", ls, err)
+			return err
+		}
+	}
 	return nil
 }
 
@@ -841,8 +1053,8 @@ func (c Client) CreatePeerRouterPort(localRouter, remoteRouter, localRouterPortI
 		}
 	}
 
-	_, err = c.ovnNbCommand("set", "logical_router_port", localRouterPort,
-		fmt.Sprintf("networks=%s", strings.ReplaceAll(localRouterPortIP, ",", " ")))
+	networks := strings.ReplaceAll(strings.Join(strings.Split(localRouterPortIP, ","), " "), ":", "\\:")
+	_, err = c.ovnNbCommand("set", "logical_router_port", localRouterPort, fmt.Sprintf("networks=%s", networks))
 
 	if err != nil {
 		klog.Errorf("failed to set router port %s: %v", localRouterPort, err)
@@ -1748,6 +1960,14 @@ func CheckAlive() error {
 		return err
 	}
 	return nil
+}
+
+func (c Client) GetLogicalSwitchLoadBalancer(logicalSwitch string) (string, error) {
+	output, err := c.ovnNbCommand("get", "logical_switch", logicalSwitch, "load_balancer")
+	if err != nil {
+		return "", err
+	}
+	return output, nil
 }
 
 // GetLogicalSwitchExcludeIPS get a logical switch exclude ips
