@@ -32,6 +32,7 @@ const (
 	VpcEnableOvnLbAnnotation = "ovn.kubernetes.io/enable_lb"
 	DnsEnableAnnotation      = "ovn.kubernetes.io/enable_dns"
 	DnsUuidAnnotation        = "ovn.kubernetes.io/dns_uuid"
+	ServiceLBVipAnnotation   = "ovn.kubernetes.io/service_lb_vip"
 
 	Layer2ForwardAnnotationTemplate = "%s.kubernetes.io/layer2_forward"
 	PortSecurityAnnotationTemplate  = "%s.kubernetes.io/port_security"
